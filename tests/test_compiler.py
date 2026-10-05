@@ -32,16 +32,34 @@ def ramps_of(x):
     return runs
 
 
-def brute_force_optimum(targets, lo, hi, step, max_ramps, anchors):
+def seam_ramps_of(x, seam):
+    """Ramp tally with a reset seam: per-side runs, never merged."""
+    def runs(diffs):
+        if not diffs:
+            return 0
+        r = 1
+        for a, b in zip(diffs, diffs[1:]):
+            if b != a:
+                r += 1
+        return r
+    left = [x[i + 1] - x[i] for i in range(0, seam)]
+    right = [x[i + 1] - x[i] for i in range(seam + 1, len(x) - 1)]
+    return runs(left) + runs(right)
+
+
+def brute_force_optimum(targets, lo, hi, step, max_ramps, anchors,
+                        reset_after=None):
     """Return the optimal feasible sequence by full enumeration."""
     n = len(targets)
     best = None
     for x in product(range(lo, hi + 1), repeat=n):
         if any(x[i] != v for i, v in anchors.items()):
             continue
-        if any(abs(x[i + 1] - x[i]) > step for i in range(n - 1)):
+        if any(abs(x[i + 1] - x[i]) > step for i in range(n - 1)
+               if reset_after is None or i != reset_after):
             continue
-        r = ramps_of(x)
+        r = (seam_ramps_of(x, reset_after) if reset_after is not None
+             else ramps_of(x))
         if r > max_ramps:
             continue
         errs = [abs(x[i] - targets[i]) for i in range(n)]
@@ -328,6 +346,187 @@ class RampBoundaryTests(unittest.TestCase):
         self.assertEqual(
             [(r["start"], r["end"], r["delta"]) for r in ramps],
             [(0, 3, 1), (3, 5, 0), (5, 8, -1)])
+
+    def test_seam_splits_equal_slopes(self):
+        x = [0, 1, 2, 3, 4, 5]
+        ramps = ramp_boundaries(x, reset_after=2)
+        self.assertEqual(
+            [(r["start"], r["end"], r["delta"]) for r in ramps],
+            [(0, 2, 1), (3, 5, 1)])
+
+    def test_seam_boundaries_stop_on_both_sides(self):
+        x = [0, 1, 2, 2, 1, 0, 0]
+        ramps = ramp_boundaries(x, reset_after=3)
+        self.assertEqual(
+            [(r["start"], r["end"], r["delta"]) for r in ramps],
+            [(0, 2, 1), (2, 3, 0), (4, 5, -1), (5, 6, 0)])
+
+
+class ResetSeamBruteForceTests(unittest.TestCase):
+    """Exhaustive comparison under an enabled reset seam."""
+
+    def setUp(self):
+        self._saved = (compiler.MIN_ELEMENTS, compiler.MIN_ANCHORS)
+        compiler.MIN_ELEMENTS = 4
+        compiler.MIN_ANCHORS = 2
+
+    def tearDown(self):
+        compiler.MIN_ELEMENTS, compiler.MIN_ANCHORS = self._saved
+
+    def test_seam_instances_match_brute_force(self):
+        rng = random.Random(20261005)
+        for trial in range(300):
+            n = rng.randint(4, 6)
+            lo, hi = -2, 3
+            step = rng.randint(1, 3)
+            seam = rng.randint(1, n - 3)
+            ai = sorted(rng.sample(range(n), 2))
+            av0 = rng.randint(lo, hi)
+            gap = ai[1] - ai[0]
+            if ai[0] <= seam < ai[1]:
+                # Anchors straddle the seam: values are independent because
+                # the seam edge is exempt from the step limit.
+                av1 = rng.randint(lo, hi)
+            else:
+                av1 = max(lo, min(hi, rng.randint(av0 - step * gap,
+                                                  av0 + step * gap)))
+            anchors = {ai[0]: av0, ai[1]: av1}
+            targets = [rng.randint(lo - 1, hi + 1) for _ in range(n)]
+            max_ramps = rng.randint(1, n - 2)
+            payload = {
+                "targets": targets, "delay_min": lo, "delay_max": hi,
+                "max_step": step, "max_ramps": max_ramps,
+                "anchors": [{"index": i, "value": v}
+                            for i, v in anchors.items()],
+                "reset_after": seam,
+            }
+            bf = brute_force_optimum(targets, lo, hi, step, max_ramps,
+                                     anchors, reset_after=seam)
+            if bf is None:
+                with self.assertRaises(CompileError) as ctx:
+                    compile_plan(payload)
+                self.assertEqual(ctx.exception.status, 422)
+                self.assertNotIn("delays", ctx.exception.details)
+                continue
+            plan = compile_plan(payload)
+            x = plan["delays"]
+            key = (plan["max_abs_error"], plan["total_abs_error"],
+                   plan["ramp_count"], tuple(x))
+            self.assertEqual(key, bf[0], msg=f"trial {trial}: {payload}")
+            self.assertEqual(x, bf[1], msg=f"lex tie trial {trial}")
+            self.assertEqual(plan["ramp_count"], seam_ramps_of(x, seam))
+            self.assertEqual(plan["reset_after"], seam)
+
+
+class ResetSeamInvariantTests(unittest.TestCase):
+    BASE = {
+        "targets": [10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36,
+                    38, 40],
+        "delay_min": 0, "delay_max": 100, "max_step": 4, "max_ramps": 4,
+        "anchors": [{"index": 0, "value": 10},
+                    {"index": 15, "value": 40}],
+    }
+
+    def _check(self, plan, payload):
+        x = plan["delays"]
+        n = len(x)
+        seam = payload["reset_after"]
+        self.assertEqual(plan["reset_after"], seam)
+        for a in payload["anchors"]:
+            self.assertEqual(x[a["index"]], a["value"])
+        for i, v in enumerate(x):
+            self.assertTrue(payload["delay_min"] <= v <= payload["delay_max"])
+        for i in range(n - 1):
+            if i == seam:
+                continue  # seam edge is exempt from the step limit
+            self.assertLessEqual(abs(x[i + 1] - x[i]), payload["max_step"])
+        self.assertEqual(plan["ramp_count"],
+                         seam_ramps_of(x, seam))
+        self.assertLessEqual(plan["ramp_count"], payload["max_ramps"])
+        ramps = plan["ramps"]
+        left = [r for r in ramps if r["end"] <= seam]
+        right = [r for r in ramps if r["start"] >= seam + 1]
+        self.assertTrue(left and right)
+        self.assertEqual(left[0]["start"], 0)
+        self.assertEqual(left[-1]["end"], seam)
+        self.assertEqual(right[0]["start"], seam + 1)
+        self.assertEqual(right[-1]["end"], n - 1)
+        # ramps partition each side and adjacent deltas differ
+        for group in (left, right):
+            for r, s in zip(group, group[1:]):
+                self.assertEqual(r["end"], s["start"])
+                self.assertNotEqual(r["delta"], s["delta"])
+            for r in group:
+                for i in range(r["start"], r["end"]):
+                    self.assertEqual(x[i + 1] - x[i], r["delta"])
+
+    def test_equal_slopes_are_not_merged(self):
+        payload = dict(self.BASE, reset_after=7)
+        plan = compile_plan(payload)
+        self.assertEqual(
+            [(r["start"], r["end"], r["delta"]) for r in plan["ramps"]],
+            [(0, 7, 2), (8, 15, 2)])
+        self.assertEqual(plan["ramp_count"], 2)
+        self._check(plan, payload)
+
+    def test_seam_edge_step_exemption(self):
+        # Only the seam edge can bridge 14 -> 26 under max_step=2.
+        payload = dict(self.BASE, max_step=2, max_ramps=3,
+                       anchors=[{"index": 0, "value": 0},
+                                {"index": 7, "value": 14},
+                                {"index": 8, "value": 26},
+                                {"index": 15, "value": 40}],
+                       reset_after=7)
+        plan = compile_plan(payload)
+        self._check(plan, payload)
+        x = plan["delays"]
+        self.assertEqual((x[7], x[8]), (14, 26))
+        self.assertGreater(abs(x[8] - x[7]), payload["max_step"])
+
+    def test_budget_covers_both_sides(self):
+        # Each side is forced through at least one ramp, so one total ramp
+        # is impossible even though each side is simple.
+        payload = dict(self.BASE, max_ramps=1, reset_after=7,
+                       anchors=[{"index": 0, "value": 0},
+                                {"index": 7, "value": 14},
+                                {"index": 8, "value": 26},
+                                {"index": 15, "value": 40}],
+                       max_step=4)
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(payload)
+        self.assertEqual(ctx.exception.status, 422)
+        self.assertTrue(any(c["kind"] == "ramp_budget"
+                            for c in ctx.exception.details["conflicts"]))
+        self.assertNotIn("delays", ctx.exception.details)
+
+    def test_subarray_anchor_step_conflict(self):
+        payload = dict(self.BASE, max_step=1, reset_after=7,
+                       anchors=[{"index": 0, "value": 0},
+                                {"index": 5, "value": 40},
+                                {"index": 15, "value": 40}])
+        with self.assertRaises(CompileError) as ctx:
+            compile_plan(payload)
+        self.assertEqual(ctx.exception.status, 422)
+        self.assertNotIn("delays", ctx.exception.details)
+        kinds = {(c["kind"], c["start"], c["end"])
+                 for c in ctx.exception.details["conflicts"]}
+        # Conflict is localized inside the left sub-array and never reports a
+        # cone crossing the seam (7 -> 15 is reachable without a seam).
+        self.assertIn(("step_unreachable", 0, 5), kinds)
+        self.assertNotIn(("step_unreachable", 5, 15), kinds)
+
+    def test_seam_validation_bounds(self):
+        n = len(self.BASE["targets"])
+        for bad in (-1, 0, n - 2, n - 1, 1.5, True, "3"):
+            with self.assertRaises(CompileError) as ctx:
+                compile_plan(dict(self.BASE, reset_after=bad))
+            self.assertEqual(ctx.exception.status, 400, bad)
+
+    def test_omitted_seam_response_has_no_seam_field(self):
+        plan = compile_plan(self.BASE)
+        self.assertNotIn("reset_after", plan)
+        plan2 = compile_plan(dict(self.BASE, reset_after=None))
+        self.assertNotIn("reset_after", plan2)
 
 
 if __name__ == "__main__":

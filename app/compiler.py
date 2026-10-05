@@ -13,6 +13,18 @@ A sequence ``x[0..n-1]`` is feasible when:
 * the number of maximal constant runs (ramps) of the adjacent-difference
   sequence ``d[i] = x[i+1] - x[i]`` does not exceed ``max_ramps``.
 
+Optional reset seam (``reset_after = s``): elements ``0..s`` and ``s+1..n-1``
+form two independently sloped sub-arrays, each with at least two elements.
+
+* the closed interval, the step limit and the anchors still apply inside each
+  sub-array (anchor cones never cross the seam);
+* the seam edge ``(s, s+1)`` is exempt from the step limit;
+* ramps are tallied per sub-array: runs over edges ``0..s-1`` plus runs over
+  edges ``s+1..n-2``; equal slopes across the seam are never merged, so the
+  last left ramp ends at element ``s`` and the first right ramp starts at
+  element ``s+1`` (the seam edge itself belongs to no ramp);
+* ``max_ramps`` bounds the total number of ramps on both sides.
+
 Optimization order, lexicographic (the first differing key decides):
 
 1. minimize the maximum absolute error ``max_i |x[i] - target[i]|``;
@@ -132,6 +144,17 @@ def validate_request(payload) -> dict:
             f"'max_ramps' must be between 1 and {n - 1} for {n} elements",
             400, {"field": "max_ramps"})
 
+    # Optional reset seam: zero-based element after which the two independently
+    # sloped sub-arrays begin; each side must contain at least two elements.
+    reset_after = None
+    if "reset_after" in payload and payload["reset_after"] is not None:
+        reset_after = _as_int("reset_after", payload["reset_after"])
+        if not (1 <= reset_after <= n - 3):
+            raise CompileError(
+                f"'reset_after' must leave at least two elements on each side "
+                f"(an integer in [1, {n - 3}] for {n} elements, got "
+                f"{reset_after})", 400, {"field": "reset_after"})
+
     anchors_raw = payload.get("anchors")
     if not isinstance(anchors_raw, list):
         raise CompileError("'anchors' must be an array", 400,
@@ -170,6 +193,7 @@ def validate_request(payload) -> dict:
         "max_step": max_step,
         "max_ramps": max_ramps,
         "anchors": anchors,
+        "reset_after": reset_after,
     }
 
 
@@ -189,6 +213,7 @@ def structural_check(req: dict) -> StructuralResult:
     n = req["n"]
     lo, hi = req["lo"], req["hi"]
     step = req["max_step"]
+    seam = req["reset_after"]
     anchors = req["anchors"]
     anchor_items = sorted(anchors.items())
     conflicts: list[Conflict] = []
@@ -209,36 +234,50 @@ def structural_check(req: dict) -> StructuralResult:
     blo = [lo] * n
     bhi = [hi] * n
 
-    first_idx, first_val = anchor_items[0]
-    for i in range(first_idx):
-        dist = first_idx - i
-        blo[i] = max(blo[i], first_val - step * dist)
-        bhi[i] = min(bhi[i], first_val + step * dist)
-    blo[first_idx] = bhi[first_idx] = first_val
+    # With a reset seam the two sub-arrays are structurally independent:
+    # anchor cones never cross the seam and the seam edge (s, s+1) is exempt
+    # from the step limit.  Without a seam this is a single [0, n) range.
+    if seam is None:
+        sides = [(0, n - 1, anchor_items)]
+    else:
+        left = [(i, v) for i, v in anchor_items if i <= seam]
+        right = [(i, v) for i, v in anchor_items if i > seam]
+        sides = [(0, seam, left), (seam + 1, n - 1, right)]
 
     unreachable_spans = []
-    for (i0, v0), (i1, v1) in zip(anchor_items, anchor_items[1:]):
-        gap = i1 - i0
-        need = abs(v1 - v0)
-        if need > step * gap:
-            conflicts.append(Conflict(
-                "step_unreachable", i0, i1,
-                {"from_value": v0, "to_value": v1, "steps": gap,
-                 "required_min_step": -(-need // gap),
-                 "max_step": step, "min_total_change": need,
-                 "max_total_change": step * gap}))
-            unreachable_spans.append((i0, i1))
-        for j in range(i0, i1 + 1):
-            d1 = j - i0
-            d2 = i1 - j
-            blo[j] = max(blo[j], v0 - step * d1, v1 - step * d2)
-            bhi[j] = min(bhi[j], v0 + step * d1, v1 + step * d2)
+    for side_lo_i, side_hi_i, items in sides:
+        if not items:
+            continue  # no anchors on this side: only global bounds + step
 
-    last_idx, last_val = anchor_items[-1]
-    for i in range(last_idx + 1, n):
-        dist = i - last_idx
-        blo[i] = max(blo[i], last_val - step * dist)
-        bhi[i] = min(bhi[i], last_val + step * dist)
+        first_idx, first_val = items[0]
+        for i in range(side_lo_i, first_idx):
+            dist = first_idx - i
+            blo[i] = max(blo[i], first_val - step * dist)
+            bhi[i] = min(bhi[i], first_val + step * dist)
+        blo[first_idx] = bhi[first_idx] = first_val
+
+        for (i0, v0), (i1, v1) in zip(items, items[1:]):
+            gap = i1 - i0
+            need = abs(v1 - v0)
+            if need > step * gap:
+                conflicts.append(Conflict(
+                    "step_unreachable", i0, i1,
+                    {"from_value": v0, "to_value": v1, "steps": gap,
+                     "required_min_step": -(-need // gap),
+                     "max_step": step, "min_total_change": need,
+                     "max_total_change": step * gap}))
+                unreachable_spans.append((i0, i1))
+            for j in range(i0, i1 + 1):
+                d1 = j - i0
+                d2 = i1 - j
+                blo[j] = max(blo[j], v0 - step * d1, v1 - step * d2)
+                bhi[j] = min(bhi[j], v0 + step * d1, v1 + step * d2)
+
+        last_idx, last_val = items[-1]
+        for i in range(last_idx + 1, side_hi_i + 1):
+            dist = i - last_idx
+            blo[i] = max(blo[i], last_val - step * dist)
+            bhi[i] = min(bhi[i], last_val + step * dist)
 
     bands = []
     for i in range(n):
@@ -298,51 +337,78 @@ def _best_two(p: dict):
 
 
 def feasible_with_widths(req, widths) -> bool:
-    """True iff some sequence fits ``widths`` while using <= max_ramps ramps."""
+    """True iff some sequence fits ``widths`` while using <= max_ramps ramps.
+
+    With a reset seam the step limit is skipped on the seam edge and the ramp
+    run restarts there: the left ramp tally carries over, but the first right
+    edge always starts a fresh ramp even when its slope matches the left one.
+    """
     step = req["max_step"]
     cap = req["max_ramps"]
+    seam = req["reset_after"]
 
-    # prev[v] maps last-delta -> ramps used so far; None is the position-0
-    # sentinel so the first concrete edge always starts ramp number one.
+    # prev[v] maps last-delta -> ramps used so far; None is the sentinel for
+    # "no edge yet on this side" (position 0, or the first element after the
+    # seam) so the first concrete edge of each side starts ramp number one.
     prev = {v: {None: 0} for v in range(widths[0][0], widths[0][1] + 1)}
     stats = {u: _best_two(p) for u, p in prev.items()}
 
     for i in range(1, req["n"]):
         lo_w, hi_w = widths[i]
         plo, phi = widths[i - 1]
-        if (hi_w - lo_w + 1) * min(2 * step + 1, phi - plo + 1) > MAX_LAYER_OPS:
+        on_seam_edge = seam is not None and i == seam + 1
+        if not on_seam_edge and (
+                (hi_w - lo_w + 1) * min(2 * step + 1, phi - plo + 1)
+                > MAX_LAYER_OPS):
             raise CompileError(
                 "integer delay domain too large to compile exactly at "
                 f"element {i}; tighten 'delay_min'/'delay_max' or reduce "
                 "the target spread", 400, {"element": i})
+        if on_seam_edge and (hi_w - lo_w + 1) * (phi - plo + 1) > MAX_LAYER_OPS:
+            raise CompileError(
+                "integer delay domain too large to compile exactly at the "
+                f"reset seam (element {i}); tighten 'delay_min'/'delay_max' "
+                "or reduce the target spread", 400, {"element": i})
         cur = {}
-        for v in range(lo_w, hi_w + 1):
-            entry = {}
-            ua = max(plo, v - step)
-            ub = min(phi, v + step)
-            for u in range(ua, ub + 1):
-                st = stats.get(u)
-                if st is None:
-                    continue
-                m1, k1, m2 = st
-                d = v - u
-                cont = prev[u].get(d)              # keep the current ramp
-                brk = m1 if k1 != d else m2         # start a new ramp here
-                if brk is not None:
-                    brk += 1
-                best = None
-                if cont is not None:
-                    best = cont
-                if brk is not None and (best is None or brk < best):
-                    best = brk
-                if best is not None and best <= cap:
-                    old = entry.get(d)
-                    if old is None or best < old:
-                        entry[d] = best
-            if entry:
-                cur[v] = entry
-        if not cur:
-            return False
+        if on_seam_edge:
+            # The seam edge is unconstrained: any left value can jump to any
+            # right value, it costs no ramp, and the delta history restarts.
+            best_left = None
+            for u in range(plo, phi + 1):
+                for count in prev.get(u, {}).values():
+                    if best_left is None or count < best_left:
+                        best_left = count
+            if best_left is None or best_left > cap:
+                return False
+            cur = {v: {None: best_left} for v in range(lo_w, hi_w + 1)}
+        else:
+            for v in range(lo_w, hi_w + 1):
+                entry = {}
+                ua = max(plo, v - step)
+                ub = min(phi, v + step)
+                for u in range(ua, ub + 1):
+                    st = stats.get(u)
+                    if st is None:
+                        continue
+                    m1, k1, m2 = st
+                    d = v - u
+                    cont = prev[u].get(d)              # keep the current ramp
+                    brk = m1 if k1 != d else m2         # start a new ramp here
+                    if brk is not None:
+                        brk += 1
+                    best = None
+                    if cont is not None:
+                        best = cont
+                    if brk is not None and (best is None or brk < best):
+                        best = brk
+                    if best is not None and best <= cap:
+                        old = entry.get(d)
+                        if old is None or best < old:
+                            entry[d] = best
+                if entry:
+                    cur[v] = entry
+            if not cur:
+                return False
         prev = cur
         stats = {u: _best_two(p) for u, p in prev.items()}
     return True
@@ -370,10 +436,15 @@ def ramp_feasible_on_bands(req, bands):
 # ---------------------------------------------------------------------------
 
 
-def _incoming_keys(widths, i, step):
-    """Map each value at position i to the possible deltas of edge (i-1)."""
-    if i == 0:
-        return {v: (None,) for v in range(widths[0][0], widths[0][1] + 1)}
+def _incoming_keys(widths, i, step, seam=None):
+    """Map each value at position i to the possible deltas of edge (i-1).
+
+    At the first element of a side (position 0, or the element right after the
+    reset seam) the sole key is the None sentinel: the entering seam edge is
+    exempt from the step limit and belongs to no ramp.
+    """
+    if i == 0 or (seam is not None and i == seam + 1):
+        return {v: (None,) for v in range(widths[i][0], widths[i][1] + 1)}
     plo, phi = widths[i - 1]
     keys = {}
     for v in range(widths[i][0], widths[i][1] + 1):
@@ -388,33 +459,34 @@ def optimal_plan(req, widths) -> list:
 
     Assumes the feasibility DP has already proved that ``widths`` admits a
     sequence within the ramp budget.
+
+    Without a reset seam this is one backward DP over positions 0..n-1.  With
+    a seam at ``s`` the right side (s+1..n-1) gets its own backward DP; the
+    seam-element cell at s joins both sides over the unconstrained seam edge,
+    keyed by the ramp budget handed to the right side, so reconstruction can
+    reserve ramps globally while recovering each side lexicographically.
     """
     n = req["n"]
     step = req["max_step"]
     cap = req["max_ramps"]
     targets = req["targets"]
+    seam = req["reset_after"]
 
     def vals(i):
         return range(widths[i][0], widths[i][1] + 1)
 
     # G[i][v] maps state (din, b) -> (S, T), where ``din`` is the delta of
-    # the edge entering position i (None at i == 0) and ``b`` is the number
-    # of *new* ramps still allowed on edges i..n-2.  S is the minimum sum of
-    # absolute errors at positions i..n-1 over continuations using T <= b new
-    # ramps; ties on S are broken by smaller T.
+    # the edge entering position i (None at the first element of a side) and
+    # ``b`` is the number of *new* ramps still allowed on this side's
+    # remaining edges.  S is the minimum sum of absolute errors over the
+    # remaining positions of continuations using T <= b new ramps; ties on S
+    # are broken by smaller T.  At the seam element S spans both sides and
+    # ``b`` is the budget reserved for the whole right side.
     G = [None] * n
 
-    base = {}
-    keys_last = _incoming_keys(widths, n - 1, step)
-    for v in vals(n - 1):
-        e = abs(v - targets[n - 1])
-        base[v] = {(d, b): (e, 0) for d in keys_last[v]
-                   for b in range(cap + 1)}
-    G[n - 1] = base
-
-    for i in range(n - 2, -1, -1):
+    def normal_layer(i):
         nlo, nhi = widths[i + 1]
-        keys_here = _incoming_keys(widths, i, step)
+        keys_here = _incoming_keys(widths, i, step, seam)
         layer = {}
         for v in vals(i):
             ev = abs(v - targets[i])
@@ -469,48 +541,107 @@ def optimal_plan(req, widths) -> list:
                         cell[(din, b)] = best
             if cell:
                 layer[v] = cell
-        G[i] = layer
+        return layer
 
-    # Greedy left-to-right: the prefix is fixed, so among feasible next
-    # values minimizing the stored suffix pair and then the value itself
-    # yields the globally lexicographically smallest optimum.
-    x = [0] * n
-    prev_din = None
-    used_ramps = 0
-    for i in range(n):
-        if i == 0:
-            choices = []
-            for v in vals(0):
-                st = G[0].get(v, {}).get((None, cap))
-                if st is not None:
-                    choices.append((st[0], st[1], v))
-            if not choices:  # pragma: no cover - guarded by feasibility DP
-                raise CompileError("internal reconstruction failure", 500)
-            _, _, vi = min(choices, key=lambda z: (z[0], z[1], z[2]))
-            x[0] = vi
-            continue
+    def seam_layer(i):
+        """Join cell for the left element of the seam (position i == s).
 
-        choices = []
+        The edge to i+1 is unconstrained and belongs to no ramp; the state
+        budget ``b`` is handed wholesale to the right side (b >= 1, since it
+        has at least one edge).  The value pair is (errors on i..n-1, ramps
+        used on the right side); the incoming ``din`` still describes the
+        ordinary left-side edge (i-1, i), so left ramp decisions at i-1 work
+        exactly like every other normal transition.
+        """
+        nlo, nhi = widths[i + 1]
+        keys_here = _incoming_keys(widths, i, step, seam)
+        layer = {}
         for v in vals(i):
-            d = v - x[i - 1]
-            if abs(d) > step:
-                continue
-            extra = 0 if d == prev_din else 1
-            b_remaining = cap - used_ramps - extra
-            if b_remaining < 0:
-                continue
-            st = G[i].get(v, {}).get((d, b_remaining))
-            if st is None:
-                continue
-            total_ramps = used_ramps + extra + st[1]
-            choices.append((st[0], total_ramps, v, d))
+            ev = abs(v - targets[i])
+            by_budget = {}
+            for b in range(1, cap + 1):
+                best = None
+                for w in range(nlo, nhi + 1):
+                    st = G[i + 1].get(w, {}).get((None, b))
+                    if st is None:
+                        continue
+                    cand = (st[0], st[1], w)
+                    if best is None or cand < best:
+                        best = cand
+                if best is not None:
+                    by_budget[b] = (ev + best[0], best[1])
+            if by_budget:
+                layer[v] = {(din, b): pair
+                            for din in keys_here[v]
+                            for b, pair in by_budget.items()}
+        return layer
+
+    # Base layer at the final element.
+    base = {}
+    keys_last = _incoming_keys(widths, n - 1, step, seam)
+    for v in vals(n - 1):
+        e = abs(v - targets[n - 1])
+        base[v] = {(d, b): (e, 0) for d in keys_last[v]
+                   for b in range(cap + 1)}
+    G[n - 1] = base
+
+    if seam is None:
+        fill_from, fill_to = n - 2, -1
+    else:
+        # Right-side interior first (n-2 .. s+1), then the seam cell, then
+        # the left side (s-1 .. 0).
+        for i in range(n - 2, seam, -1):
+            G[i] = normal_layer(i)
+        G[seam] = seam_layer(seam)
+        fill_from, fill_to = seam - 1, -1
+    for i in range(fill_from, fill_to, -1):
+        G[i] = normal_layer(i)
+
+    def reconstruct(lo, hi, budget):
+        """Greedy lex-min recovery over one side; returns ramps used."""
+        choices = []
+        for v in vals(lo):
+            st = G[lo].get(v, {}).get((None, budget))
+            if st is not None:
+                choices.append((st[0], st[1], v))
         if not choices:  # pragma: no cover - guarded by feasibility DP
             raise CompileError("internal reconstruction failure", 500)
-        _, _, vi, di = min(choices, key=lambda z: (z[0], z[1], z[2]))
-        if di != prev_din:
-            used_ramps += 1
-        prev_din = di
-        x[i] = vi
+        _, _, vi = min(choices, key=lambda z: (z[0], z[1], z[2]))
+        x[lo] = vi
+        prev_din = None
+        used = 0
+        for i in range(lo + 1, hi + 1):
+            choices = []
+            for v in vals(i):
+                d = v - x[i - 1]
+                if abs(d) > step:
+                    continue
+                extra = 0 if d == prev_din else 1
+                b_remaining = budget - used - extra
+                if b_remaining < 0:
+                    continue
+                st = G[i].get(v, {}).get((d, b_remaining))
+                if st is None:
+                    continue
+                total_ramps = used + extra + st[1]
+                choices.append((st[0], total_ramps, v, d))
+            if not choices:  # pragma: no cover - guarded by feasibility DP
+                raise CompileError("internal reconstruction failure", 500)
+            _, _, vi, di = min(choices, key=lambda z: (z[0], z[1], z[2]))
+            if di != prev_din:
+                used += 1
+            prev_din = di
+            x[i] = vi
+        return used
+
+    x = [0] * n
+    if seam is None:
+        reconstruct(0, n - 1, cap)
+    else:
+        used_left = reconstruct(0, seam, cap)
+        # The seam cell was reached with exactly the unspent left budget,
+        # which it reserved for the right side.
+        reconstruct(seam + 1, n - 1, cap - used_left)
     return x
 
 
@@ -521,32 +652,49 @@ def optimal_plan(req, widths) -> list:
 
 def _ramp_budget_conflict(req):
     items = sorted(req["anchors"].items())
+    seam = req["reset_after"]
+    pairs = [(a, b) for a, b in zip(items, items[1:])
+             if seam is None or not (a[0] <= seam < b[0])]
     segments = [
         {"start": i0, "end": i1, "total_change": v1 - v0, "steps": i1 - i0}
-        for (i0, v0), (i1, v1) in zip(items, items[1:])
+        for (i0, v0), (i1, v1) in pairs
     ]
     return {"kind": "ramp_budget", "start": 0, "end": req["n"] - 1,
             "max_ramps": req["max_ramps"], "anchor_segments": segments}
 
 
-def ramp_boundaries(x: list) -> list:
+def ramp_boundaries(x: list, reset_after=None) -> list:
     """Maximal equal-difference runs as [{start, end, delta}, ...].
 
     ``start``/``end`` are the spanned element indices (both inclusive).
+
+    With ``reset_after = s`` the two sides are tallied independently: the
+    last left ramp ends exactly at element ``s`` and the first right ramp
+    starts exactly at element ``s+1``, even when both slopes are identical;
+    the seam edge (s, s+1) belongs to no ramp.
     """
     if len(x) < 2:
         return []
-    ramps = []
-    run_start = 0
-    d = x[1] - x[0]
-    for i in range(1, len(x) - 1):
-        nd = x[i + 1] - x[i]
-        if nd != d:
-            ramps.append({"start": run_start, "end": i, "delta": d})
-            run_start = i
-            d = nd
-    ramps.append({"start": run_start, "end": len(x) - 1, "delta": d})
-    return ramps
+
+    def side(lo, hi):
+        if hi - lo < 1:
+            return []
+        out = []
+        run_start = lo
+        d = x[lo + 1] - x[lo]
+        for i in range(lo, hi):
+            nd = x[i + 1] - x[i]
+            if nd != d:
+                out.append({"start": run_start, "end": i, "delta": d})
+                run_start = i
+                d = nd
+        out.append({"start": run_start, "end": hi, "delta": d})
+        return out
+
+    if reset_after is None:
+        return side(0, len(x) - 1)
+    return (side(0, reset_after)
+            + side(reset_after + 1, len(x) - 1))
 
 
 def _saturation_budget(req, bands):
@@ -634,8 +782,9 @@ def compile_plan(payload) -> dict:
 
     x = optimal_plan(req, widths)
     errors = [x[i] - t[i] for i in range(req["n"])]
-    ramps = ramp_boundaries(x)
-    return {
+    seam = req["reset_after"]
+    ramps = ramp_boundaries(x, seam)
+    plan = {
         "n": req["n"],
         "delays": x,
         "errors": errors,
@@ -644,6 +793,11 @@ def compile_plan(payload) -> dict:
         "max_abs_error": max(abs(e) for e in errors),
         "total_abs_error": sum(abs(e) for e in errors),
     }
+    # Echo the seam only when one was requested; omitting it keeps the
+    # response byte-for-byte compatible with the seam-less API.
+    if seam is not None:
+        plan["reset_after"] = seam
+    return plan
 
 
 def _guard_refusal(req):

@@ -147,6 +147,46 @@ class HttpTests(unittest.TestCase):
                 for i in range(r["start"], r["end"]):
                     self.assertEqual(x[i + 1] - x[i], r["delta"])
 
+    def test_reset_seam_compile(self):
+        payload = dict(GOOD_PAYLOAD, reset_after=7)
+        with ServerHarness() as h:
+            status, body = h.post("/api/delay-plans/compile", payload)
+            self.assertEqual(status, 200, body)
+            plan = body["plan"]
+            self.assertEqual(plan["reset_after"], 7)
+            x = plan["delays"]
+            # seam edge exempt; every other edge honors the step limit
+            self.assertTrue(all(abs(x[i + 1] - x[i]) <= payload["max_step"]
+                                for i in range(11) if i != 7))
+            ramps = plan["ramps"]
+            left = [r for r in ramps if r["end"] <= 7]
+            right = [r for r in ramps if r["start"] >= 8]
+            self.assertTrue(left and right)
+            self.assertEqual(left[-1]["end"], 7)
+            self.assertEqual(right[0]["start"], 8)
+            self.assertEqual(plan["ramp_count"], len(ramps))
+
+    def test_reset_seam_infeasible_returns_422(self):
+        # Anchor pair across the seam is fine; a conflict strictly inside the
+        # left sub-array must still be reported with 422 and no delay table.
+        payload = dict(GOOD_PAYLOAD, reset_after=7, max_step=1,
+                       anchors=[{"index": 0, "value": 0},
+                                {"index": 5, "value": 11},
+                                {"index": 11, "value": 11}])
+        with ServerHarness() as h:
+            status, body = h.post("/api/delay-plans/compile", payload)
+            self.assertEqual(status, 422, body)
+            self.assertIn("conflicts", body)
+            self.assertNotIn("delays", body)
+            self.assertNotIn("plan", body)
+
+    def test_reset_seam_bad_value_returns_400(self):
+        with ServerHarness() as h:
+            for bad in (0, 11, -2, 1.5):
+                status, body = h.post("/api/delay-plans/compile",
+                                      dict(GOOD_PAYLOAD, reset_after=bad))
+                self.assertEqual(status, 400, (bad, body))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

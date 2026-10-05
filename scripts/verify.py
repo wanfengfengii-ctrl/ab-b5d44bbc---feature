@@ -5,10 +5,16 @@ Aggregates three independent checks and exits non-zero if any of them fails:
 1. **code tests**      -- the full unittest suite (compiler + HTTP layer);
 2. **build artifacts** -- the manifest baked at image build time is compared
                           against the files actually present in the image;
-3. **API smoke**       -- health probe plus a typical compile request and an
-                          infeasible request against the running service
-                          (``API_BASE_URL``); if no service URL is given, an
-                          in-process server is started for the smoke checks.
+3. **API smoke**       -- health probe plus compile requests against the
+                          running service (``API_BASE_URL``): a typical
+                          request with the reset seam omitted, the same
+                          instance with ``reset_after`` enabled (ramp
+                          boundaries must stop at the seam and equal slopes
+                          must not merge), an infeasible request whose
+                          conflict is confined to one sub-array, and a
+                          seam-less infeasible request; if no service URL is
+                          given, an in-process server is started for the
+                          smoke checks.
 
 The final line is a machine-readable summary and the process exit code is the
 number of failed check groups (0 == all green).
@@ -49,6 +55,22 @@ CONFLICT_REQUEST = dict(
     TYPICAL_REQUEST,
     max_step=1,
     anchors=[{"index": 0, "value": 10}, {"index": 15, "value": 40}],
+)
+
+# Reset seam after element 7: the two sub-arrays independently hold the same
+# +2 slope, which must be tallied as two ramps (never merged across the seam)
+# with ramp boundaries stopping exactly at elements 7 and 8.
+SEAM_REQUEST = dict(TYPICAL_REQUEST, reset_after=7)
+
+# A step/anchor conflict confined to the left sub-array (elements 0..7); the
+# seam must not make it reachable, and the 422 must leak no delay table.
+SEAM_CONFLICT_REQUEST = dict(
+    TYPICAL_REQUEST,
+    reset_after=7,
+    max_step=1,
+    anchors=[{"index": 0, "value": 10},
+             {"index": 5, "value": 40},
+             {"index": 15, "value": 40}],
 )
 
 
@@ -181,6 +203,43 @@ def _validate_plan(body):
     assert plan["total_abs_error"] == sum(abs(e) for e in plan["errors"])
 
 
+def _validate_seam_plan(body):
+    plan = body["plan"]
+    n = len(plan["delays"])
+    req = SEAM_REQUEST
+    seam = req["reset_after"]
+    x = plan["delays"]
+    assert plan.get("reset_after") == seam, "seam must be echoed"
+    assert n == len(req["targets"]), "plan must cover every element"
+    assert len(plan["errors"]) == n, "one error per element"
+    for a in req["anchors"]:
+        assert x[a["index"]] == a["value"], "anchor must be hit exactly"
+    for i, v in enumerate(x):
+        assert req["delay_min"] <= v <= req["delay_max"], "global interval"
+        assert plan["errors"][i] == v - req["targets"][i], "error values"
+    for i in range(n - 1):
+        if i == seam:
+            continue  # the seam edge is exempt from the step limit
+        assert abs(x[i + 1] - x[i]) <= req["max_step"], "step limit in sub-array"
+    ramps = plan["ramps"]
+    left = [r for r in ramps if r["end"] <= seam]
+    right = [r for r in ramps if r["start"] >= seam + 1]
+    assert left and right, "both sub-arrays report ramps"
+    assert left[0]["start"] == 0 and left[-1]["end"] == seam, "left boundary"
+    assert (right[0]["start"] == seam + 1
+            and right[-1]["end"] == n - 1), "right boundary"
+    for group in (left, right):
+        for r, s in zip(group, group[1:]):
+            assert r["end"] == s["start"] and r["delta"] != s["delta"]
+        for r in group:
+            for i in range(r["start"], r["end"]):
+                assert x[i + 1] - x[i] == r["delta"]
+    assert plan["ramp_count"] == len(ramps) <= req["max_ramps"]
+    # identical slopes on both sides must never merge
+    assert left[-1]["delta"] == right[0]["delta"] == 2
+    assert len(ramps) == 2
+
+
 def check_api_smoke():
     print("== [3/3] API smoke ==")
     base_url = os.environ.get("API_BASE_URL")
@@ -210,9 +269,47 @@ def check_api_smoke():
             print(json.dumps(body, indent=2))
             return False
         plan = body["plan"]
-        print(f"   typical compile: PASS "
+        assert "reset_after" not in plan, "omitted seam stays out of response"
+        print(f"   typical compile (seam omitted): PASS "
               f"(E_max={plan['max_abs_error']}, E_sum={plan['total_abs_error']}, "
               f"ramps={plan['ramp_count']})")
+
+        status, body = _request("POST",
+                                f"{base_url}/api/delay-plans/compile",
+                                SEAM_REQUEST)
+        if status != 200:
+            print(f"   seam compile returned {status}: {body}")
+            return False
+        try:
+            _validate_seam_plan(body)
+        except AssertionError as e:
+            print(f"   seam plan validation failed: {e}")
+            print(json.dumps(body, indent=2))
+            return False
+        plan = body["plan"]
+        print(f"   seam compile (reset_after={plan['reset_after']}): PASS "
+              f"(E_max={plan['max_abs_error']}, E_sum={plan['total_abs_error']}, "
+              f"ramps={plan['ramp_count']}, boundaries "
+              f"{plan['ramps'][0]['start']}-{plan['ramps'][0]['end']}/"
+              f"{plan['ramps'][1]['start']}-{plan['ramps'][1]['end']})")
+
+        status, body = _request("POST",
+                                f"{base_url}/api/delay-plans/compile",
+                                SEAM_CONFLICT_REQUEST)
+        if status != 422:
+            print(f"   seam conflict request expected 422, got {status}: {body}")
+            return False
+        if "conflicts" not in body or not body["conflicts"]:
+            print("   422 body must list conflict intervals")
+            return False
+        if "delays" in body or "plan" in body:
+            print("   infeasible response leaked a partial delay table")
+            return False
+        c0 = body["conflicts"][0]
+        assert c0["end"] <= SEAM_CONFLICT_REQUEST["reset_after"], (
+            "conflict interval must stay inside one sub-array")
+        print(f"   seam conflict request: PASS (422 {c0['kind']} "
+              f"[{c0['start']},{c0['end']}], no partial table)")
 
         status, body = _request("POST",
                                 f"{base_url}/api/delay-plans/compile",
