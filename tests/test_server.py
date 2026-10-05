@@ -148,5 +148,71 @@ class HttpTests(unittest.TestCase):
                     self.assertEqual(x[i + 1] - x[i], r["delta"])
 
 
+SEAM_PAYLOAD = {
+    "targets": [10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40],
+    "delay_min": 0, "delay_max": 100, "max_step": 4, "max_ramps": 4,
+    "reset_after": 7,
+    "anchors": [{"index": 0, "value": 10}, {"index": 7, "value": 24},
+                {"index": 8, "value": 26}, {"index": 15, "value": 40}],
+}
+
+
+class SeamHttpTests(unittest.TestCase):
+    def test_seam_compile_success(self):
+        with ServerHarness() as h:
+            status, body = h.post("/api/delay-plans/compile", SEAM_PAYLOAD)
+            self.assertEqual(status, 200, body)
+            plan = body["plan"]
+            self.assertEqual(plan["reset_after"], 7)
+            x = plan["delays"]
+            self.assertEqual(len(x), 16)
+            # step limit applies within each subarray, not on edge 7
+            for i in range(15):
+                if i == 7:
+                    continue
+                self.assertLessEqual(abs(x[i + 1] - x[i]), 4)
+            # boundaries stop exactly on the two seam sides
+            self.assertTrue(any(r["end"] == 7 for r in plan["ramps"]))
+            self.assertTrue(any(r["start"] == 8 for r in plan["ramps"]))
+            # total ramp budget is still enforced
+            self.assertLessEqual(plan["ramp_count"], 4)
+            for r, s in zip(plan["ramps"], plan["ramps"][1:]):
+                self.assertIn(s["start"] - r["end"], (0, 1))
+
+    def test_omitted_seam_response_has_no_seam_field(self):
+        legacy = {k: v for k, v in SEAM_PAYLOAD.items()
+                  if k != "reset_after"}
+        with ServerHarness() as h:
+            status, body = h.post("/api/delay-plans/compile", legacy)
+            self.assertEqual(status, 200, body)
+            self.assertNotIn("reset_after", body["plan"])
+
+    def test_seam_bad_value_returns_400(self):
+        with ServerHarness() as h:
+            status, body = h.post(
+                "/api/delay-plans/compile",
+                dict(SEAM_PAYLOAD, reset_after=0))
+            self.assertEqual(status, 400)
+            self.assertEqual(body.get("field"), "reset_after")
+            self.assertNotIn("delays", body)
+
+    def test_seam_internal_conflict_returns_422_no_table(self):
+        # Anchors 0 and 3 on the left subarray violate max_step; the seam
+        # must not make them reachable, and no partial table is returned.
+        payload = dict(
+            SEAM_PAYLOAD, max_step=1,
+            anchors=[{"index": 0, "value": 10}, {"index": 3, "value": 40},
+                     {"index": 8, "value": 26}, {"index": 15, "value": 33}])
+        with ServerHarness() as h:
+            status, body = h.post("/api/delay-plans/compile", payload)
+            self.assertEqual(status, 422, body)
+            self.assertIn("conflicts", body)
+            self.assertNotIn("delays", body)
+            self.assertNotIn("plan", body)
+            kinds = {(c["kind"], c["start"], c["end"])
+                     for c in body["conflicts"]}
+            self.assertIn(("step_unreachable", 0, 3), kinds)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -5,10 +5,12 @@ Aggregates three independent checks and exits non-zero if any of them fails:
 1. **code tests**      -- the full unittest suite (compiler + HTTP layer);
 2. **build artifacts** -- the manifest baked at image build time is compared
                           against the files actually present in the image;
-3. **API smoke**       -- health probe plus a typical compile request and an
-                          infeasible request against the running service
-                          (``API_BASE_URL``); if no service URL is given, an
-                          in-process server is started for the smoke checks.
+3. **API smoke**       -- health probe plus a typical compile request, an
+                          infeasible request, a reset-seam-enabled request
+                          and the same request with the seam omitted
+                          against the running service (``API_BASE_URL``);
+                          if no service URL is given, an in-process server
+                          is started for the smoke checks.
 
 The final line is a machine-readable summary and the process exit code is the
 number of failed check groups (0 == all green).
@@ -50,6 +52,23 @@ CONFLICT_REQUEST = dict(
     max_step=1,
     anchors=[{"index": 0, "value": 10}, {"index": 15, "value": 40}],
 )
+
+# Reset seam after element 7: each 8-element subarray fits a constant +2
+# slope, but the two ramps must be reported separately even though the
+# slopes are identical -- and the response must echo ``reset_after``.
+SEAM_REQUEST = dict(
+    TYPICAL_REQUEST,
+    reset_after=7,
+    anchors=[{"index": 0, "value": 10}, {"index": 7, "value": 24},
+             {"index": 8, "value": 26}, {"index": 15, "value": 40}],
+)
+
+# Same shape as SEAM_REQUEST but without the seam: exercises the omitted
+# seam path end-to-end and must keep the legacy response (one merged ramp,
+# no ``reset_after`` field).
+SEAM_OMITTED_REQUEST = {
+    k: v for k, v in SEAM_REQUEST.items() if k != "reset_after"
+}
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +200,34 @@ def _validate_plan(body):
     assert plan["total_abs_error"] == sum(abs(e) for e in plan["errors"])
 
 
+def _validate_seam_plan(body, seam):
+    plan = body["plan"]
+    n = len(plan["delays"])
+    req = SEAM_REQUEST
+    x = plan["delays"]
+    assert plan.get("reset_after") == seam, "seam must be echoed"
+    assert n == len(req["targets"]), "plan must cover every element"
+    for a in req["anchors"]:
+        assert x[a["index"]] == a["value"], "anchor must be hit exactly"
+    for i, v in enumerate(x):
+        assert req["delay_min"] <= v <= req["delay_max"], "global interval"
+    for i in range(n - 1):
+        if i == seam:
+            continue  # the seam edge is exempt from the step limit
+        assert abs(x[i + 1] - x[i]) <= req["max_step"], "within-side step"
+    ramps = plan["ramps"]
+    assert ramps[0]["start"] == 0 and ramps[-1]["end"] == n - 1
+    assert any(r["end"] == seam for r in ramps), "left ramp stops at seam"
+    assert any(r["start"] == seam + 1 for r in ramps), \
+        "right ramp starts after seam"
+    for r, s in zip(ramps, ramps[1:]):
+        assert s["start"] - r["end"] in (0, 1), "ramps partition both sides"
+        if s["start"] == r["end"]:
+            assert r["delta"] != s["delta"]
+    assert plan["ramp_count"] == len(ramps) <= req["max_ramps"]
+
+
+
 def check_api_smoke():
     print("== [3/3] API smoke ==")
     base_url = os.environ.get("API_BASE_URL")
@@ -229,6 +276,43 @@ def check_api_smoke():
         c0 = body["conflicts"][0]
         print(f"   conflict request: PASS (422 {c0['kind']} "
               f"[{c0['start']},{c0['end']}], no partial table)")
+
+        # Seam enabled: two independent subarrays, ramps split at the seam.
+        status, body = _request("POST",
+                                f"{base_url}/api/delay-plans/compile",
+                                SEAM_REQUEST)
+        if status != 200:
+            print(f"   seam compile returned {status}: {body}")
+            return False
+        try:
+            _validate_seam_plan(body, SEAM_REQUEST["reset_after"])
+        except AssertionError as e:
+            print(f"   seam plan validation failed: {e}")
+            print(json.dumps(body, indent=2))
+            return False
+        seam_plan = body["plan"]
+        print(f"   seam-enabled compile: PASS "
+              f"(reset_after={seam_plan['reset_after']}, "
+              f"ramps={seam_plan['ramp_count']}, split at the seam)")
+
+        # Seam omitted: legacy semantics and response shape -- the identical
+        # slopes merge into a single ramp and no seam field is present.
+        status, body = _request("POST",
+                                f"{base_url}/api/delay-plans/compile",
+                                SEAM_OMITTED_REQUEST)
+        if status != 200:
+            print(f"   seam-omitted compile returned {status}: {body}")
+            return False
+        plan = body["plan"]
+        if "reset_after" in plan:
+            print("   omitted seam must not appear in the response")
+            return False
+        if plan["ramp_count"] != 1:
+            print(f"   omitted-seam plan expected 1 merged ramp, "
+                  f"got {plan['ramp_count']}")
+            return False
+        print("   seam-omitted compile: PASS "
+              "(legacy shape, single merged ramp)")
         return True
     finally:
         if inproc is not None:
